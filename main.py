@@ -71,5 +71,3 @@ async def generate_signal(request: PromptRequest):
 @app.get("/")
 async def health():
     return {"status": "online", "engine": "Phoenix Signal Core Layer"}
-EOF
-  
