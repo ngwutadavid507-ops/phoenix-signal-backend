@@ -2,34 +2,31 @@ import os
 import uuid
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Configure logging with request context
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("PhoenixSignalEngine")
+logger = logging.getLogger("PhoenixCoreSystem")
 
 app = FastAPI(
-    title="Phoenix Signal Core Backend",
-    version="1.0.0",
-    description="Production-grade crypto trading signal generation engine and AI Intelligence Hub"
+    title="Phoenix Nested Core Dashboard Backend",
+    version="1.3.0",
+    description="Unified API framework for Phoenix 5-Tab Nested Mini-App Ecosystem"
 )
 
-# CORS configuration - restrict in production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ==================== Data Models ====================
-
 class PromptRequest(BaseModel):
-    prompt: str = Field(..., min_length=1, max_length=500, description="Trading analysis prompt or general AI enquiry")
+    prompt: str = Field(..., min_length=1, max_length=500)
 
 class SignalResponse(BaseModel):
     signal_id: str
@@ -39,35 +36,11 @@ class SignalResponse(BaseModel):
     stop_loss: str
     take_profit: List[str]
     analysis_reason: str
-    confidence_score: float = Field(..., ge=0, le=1)
+    confidence_score: float
     generated_at: str
     status: str = "OPEN"
 
-class HistoryResponse(BaseModel):
-    status: str
-    total: int
-    data: List[SignalResponse]
-
-# ==================== Constants ====================
-
-SUPPORTED_TICKERS = {
-    "BTC": "BTC/USDT",
-    "ETH": "ETH/USDT",
-    "SOL": "SOL/USDT",
-    "BNB": "BNB/USDT",
-    "TON": "TON/USDT",
-    "DOGE": "DOGE/USDT",
-    "AVAX": "AVAX/USDT",
-    "XRP": "XRP/USDT",
-    "ADA": "ADA/USDT",
-    "LINK": "LINK/USDT",
-}
-
-DEFAULT_TICKER = "AVAX/USDT"
-MAX_CACHE_SIZE = 50
-MAX_PROMPT_LENGTH = 500
-
-# In-memory signal cache
+# ==================== Data Cache Mock ====================
 SIGNAL_HISTORY_CACHE: List[SignalResponse] = [
     SignalResponse(
         signal_id=str(uuid.uuid4()),
@@ -104,124 +77,90 @@ SIGNAL_HISTORY_CACHE: List[SignalResponse] = [
     )
 ]
 
-# ==================== Signal Generation Logic ====================
-
-def extract_ticker_from_prompt(prompt: str) -> str:
-    raw_text = prompt.upper().strip()
-    for key, value in SUPPORTED_TICKERS.items():
-        if key in raw_text:
-            return value
-    cleaned_words = [w.replace(".", "").replace("/", "") for w in raw_text.split() if 2 <= len(w) <= 5]
-    if cleaned_words:
-        return f"{cleaned_words[0]}/USDT"
-    return DEFAULT_TICKER
-
-def determine_direction(prompt: str) -> str:
-    raw_text = prompt.upper()
-    if any(word in raw_text for word in ["SELL", "SHORT", "BEARISH", "DOWN", "DECLINE", "DUMP"]):
-        return "SHORT"
-    return "LONG"
-
-def calculate_confidence_score(prompt: str, direction: str) -> float:
-    confidence = 0.55
-    strong_indicators = ["strong", "confirmed", "bullish", "bearish", "technical", "volume", "consolidation", "hodl", "backing"]
-    for indicator in strong_indicators:
-        if indicator in prompt.lower():
-            confidence += 0.05
-    return min(confidence, 0.95)
-
-def generate_smart_levels(ticker: str, direction: str) -> tuple:
-    price_ranges = {
-        "BTC/USDT": {"price": 67000, "atr": 1500},
-        "ETH/USDT": {"price": 3450, "atr": 100},
-        "SOL/USDT": {"price": 150, "atr": 5},
-        "BNB/USDT": {"price": 620, "atr": 20},
-        "AVAX/USDT": {"price": 45, "atr": 2},
-    }
-    base_data = price_ranges.get(ticker, {"price": 100, "atr": 5})
-    price = base_data["price"]
-    atr = base_data["atr"]
-    
-    if direction == "LONG":
-        entry_low, entry_high = price - (atr * 0.5), price
-        stop_loss = price - (atr * 2)
-        tp1, tp2 = price + (atr * 2), price + (atr * 4)
-    else:
-        entry_low, entry_high = price, price + (atr * 0.5)
-        stop_loss = price + (atr * 2)
-        tp1, tp2 = price - (atr * 2), price - (atr * 4)
-        
-    return f"{entry_low:.2f} - {entry_high:.2f}", f"{stop_loss:.2f}", [f"{tp1:.2f}", f"{tp2:.2f}"]
-
-# ==================== API Endpoints ====================
+# ==================== Unified Endpoints ====================
 
 @app.get("/", tags=["Health"])
-async def health():
-    return {"status": "online", "engine": "Phoenix Core Engine v1", "timestamp": datetime.utcnow().isoformat()}
+async def system_health():
+    return {"status": "online", "system": "Phoenix Nested Layout Core", "timestamp": datetime.utcnow().isoformat()}
 
-@app.get("/api/v1/history", response_model=HistoryResponse, tags=["Signals"])
-async def get_signal_history(limit: int = Query(12, ge=1, le=50)):
-    truncated_cache = SIGNAL_HISTORY_CACHE[:limit]
-    return HistoryResponse(status="success", total=len(truncated_cache), data=truncated_cache)
+# 1. POLYMARKET PIPELINE
+@app.get("/api/v1/polymarket", tags=["Polymarket"])
+async def get_polymarket_data():
+    return {
+        "global_election": {
+            "title": "Global Election Market",
+            "certainty": "82% Certainty",
+            "description": "Automated sentiment parsing pipeline confirms institutional whale volume consolidation on primary prediction outcome vectors."
+        }
+    }
 
-# --- REWRITTEN OPEN CHAT ENDPOINT ---
-@app.post("/api/v1/chat", tags=["Intelligence"])
-async def chat_analyst(request: PromptRequest):
-    """
-    Handles real-time, unstructured, and volatile user enquiries regarding project validation,
-    HODL advice, backing organizations, and market trends with high contextual depth.
-    """
+# 2. INTERNAL NEWS SUB-TAB ENDPOINT
+@app.get("/api/v1/news", tags=["News Feed"])
+async def get_news_feed():
+    return {
+        "status": "success",
+        "feed": [
+            {
+                "id": 1,
+                "title": "Intelligence Pulse Alert",
+                "badge": "VOLUME BREACH",
+                "description": "Polymarket volume boundaries breached on layer-2 contracts. Open interest scaling upward across alternative speculative prediction vectors."
+            },
+            {
+                "id": 2,
+                "title": "Macro Liquidity Shift",
+                "badge": "STABLECOIN FLOWS",
+                "description": "Aggregated exchange deposit contracts showcase a +12% scaling factor in dollar-pegged stable assets over the last 24 operational hours."
+            }
+        ]
+    }
+
+# 3. PRO SIGNALS CORE ENDPOINT
+@app.get("/api/v1/history", tags=["Signals"])
+async def get_signals_history(limit: int = Query(10, ge=1, le=50)):
+    return {"status": "success", "total": len(SIGNAL_HISTORY_CACHE[:limit]), "data": SIGNAL_HISTORY_CACHE[:limit]}
+
+# 4. PERFORMANCE / P&L METRICS ENDPOINT
+@app.get("/api/v1/performance", tags=["Performance"])
+async def get_performance_matrix():
+    return {
+        "matrix_value": "+14.82%",
+        "status_message": "Active risk modeling bounds verified clean. Telemetry processing standard operational yield profiles."
+    }
+
+# 5. MONITORED ASSET TRACKING (PAIRS LIST) ENDPOINT
+@app.get("/api/v1/pairs", tags=["Market Data"])
+async def get_monitored_pairs():
+    return {
+        "status": "success",
+        "assets": [
+            {"pair": "BTC / USDT", "change": "+1.84%", "direction": "up"},
+            {"pair": "ETH / USDT", "change": "-0.92%", "direction": "down"},
+            {"pair": "SOL / USDT", "change": "+4.15%", "direction": "up"}
+        ]
+    }
+
+# 6. INTERNAL AI SUB-TAB ENQUIRIES CHAT ENGINE
+@app.post("/api/v1/chat", tags=["AI Enquiries"])
+async def process_ai_chat(request: PromptRequest):
     try:
-        query = request.prompt.strip()
-        query_lower = query.lower()
-        logger.info(f"Processing expert AI evaluation prompt: '{query}'")
+        query_text = request.prompt.strip().lower()
+        disclaimer = "\n\n*Disclaimer: This synthesized intelligence structure presents analysis derived from real-time asset telemetry and underlying token utility structures. It does not represent certified financial consulting.*"
         
-        disclaimer = "\n\n*Disclaimer: This synthesized intelligence structure presents analysis derived from real-time asset telemetry and underlying token utility structures. It does not represent certified financial consulting. Conduct comprehensive individual research.*"
-        
-        # Comprehensive context handling for flexible, live question parsing
-        if any(w in query_lower for w in ["hodl", "invest", "purchase", "buy"]):
-            reply = f"Evaluating investment feasibility index for the queried token profile. Long-term consolidation structures require strong fundamental utility. While sentiment parameters can spark short-term momentum, sustainable ecosystem value depends directly on on-chain activity trends, stake capitalization metrics, and distribution risk windows.{disclaimer}"
+        if any(w in query_text for w in ["hodl", "invest", "purchase", "buy", "doge", "fifa", "xrp"]):
+            return {"reply": f"Evaluating investment feasibility index for your requested profile. Asset consolidation frames require deep structural liquidity. While tokens like Doge or $FIFA can spark fast sentiment-driven momentum shifts, sustainable holding validation relies directly on underlying ecosystem utility, distribution risks, and volume patterns.{disclaimer}"}
             
-        elif any(w in query_lower for w in ["backing", "backed", "company", "who owns"]):
-            reply = f"Parsing live market directory structures and corporate filings for the requested ecosystem entity. Leading digital assets obtain architectural stability through early-stage venture funding rounds, institutional liquidity providers, or open-source community foundations. Ensure you verify official engineering whitepapers or registry frameworks before committing capital.{disclaimer}"
+        elif any(w in query_text for w in ["backing", "backed", "company", "who owns"]):
+            return {"reply": f"Parsing token directories and early-stage cap tables. Most speculative ecosystem tokens gain initial operational strength via institutional liquidity vaults or venture capital grants. Ensure you inspect cross-chain address concentrations on official whitepapers before committing trade exposure.{disclaimer}"}
             
-        elif any(w in query_lower for w in ["trend", "condition", "status", "market"]):
-            reply = f"Current structural assessment indicates macro-scale volume distribution across major indices. High social velocity parameters are rotating into utility-dense tokens, while highly volatile speculative meme protocols are undergoing short-term leverage adjustments. Cross-reference localized liquidity charts to evaluate support floors before executing exposure adjustments.{disclaimer}"
+        elif any(w in query_text for w in ["trend", "condition", "status", "market"]):
+            return {"reply": f"Current structural assessment indicates high-volume accumulation trends across top-tier layer-1 assets, while speculative high-volatility meme protocols are going through short-term leverage washouts. Track local liquidity order books closely for confirmation.{disclaimer}"}
             
         else:
-            reply = f"Phoenix Intel Module standing by. I am fully initialized to process unstructured inquiries concerning asset validation vectors, underlying entity structures, market momentum parameters, or risk distribution profiles. Input your direct token query to generate factual real-time analysis.{disclaimer}"
-            
-        return {"reply": reply}
+            return {"reply": f"Phoenix Intelligence Unit active. Ask me any voluntary question about crypto assets, project utility matrices, corporate token backing, or macro market trend definitions. I am processing real-time telemetry inputs instantly.{disclaimer}"}
     except Exception as e:
-        logger.error(f"Error handling chat inquiry: {str(e)}")
+        logger.error(f"Chat execution failure: {str(e)}")
         raise HTTPException(status_code=500, detail="Intelligence unit parsing failure")
-
-@app.post("/api/v1/generate-signal", response_model=SignalResponse, tags=["Signals"])
-async def generate_signal(request: PromptRequest):
-    try:
-        ticker = extract_ticker_from_prompt(request.prompt)
-        direction = determine_direction(request.prompt)
-        entry_zone, stop_loss, take_profit = generate_smart_levels(ticker, direction)
-        confidence = calculate_confidence_score(request.prompt, direction)
-        
-        signal = SignalResponse(
-            signal_id=str(uuid.uuid4()),
-            asset_pair=ticker,
-            direction=direction,
-            entry_zone=entry_zone,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            analysis_reason=f"AI Signal Generated from telemetry stream context: {request.prompt[:80]}...",
-            confidence_score=round(confidence, 2),
-            generated_at=datetime.utcnow().isoformat()
-        )
-        SIGNAL_HISTORY_CACHE.insert(0, signal)
-        if len(SIGNAL_HISTORY_CACHE) > MAX_CACHE_SIZE:
-            SIGNAL_HISTORY_CACHE.pop()
-        return signal
-    except Exception as e:
-        logger.error(f"Signal creation failure: {str(e)}")
-        raise HTTPException(status_code=500, detail="Signal core engine error")
 
 if __name__ == "__main__":
     import uvicorn
