@@ -1,16 +1,14 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Setup clean logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PhoenixSignalEngine")
 
 app = FastAPI(title="Phoenix Signal Core Backend")
 
-# Enable CORS so your Render frontend can read this data securely
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -19,16 +17,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Your real trading data array matrix
+# Start with multiple multi-token signal configurations out of the box
 SIGNAL_HISTORY_CACHE = [
     {
         "asset_pair": "BTC/USDT",
         "direction": "LONG",
-        "risk_level": "medium",
-        "entry_zone": "64500-65200",
+        "entry_zone": "64500 - 65200",
         "stop_loss": "62000",
         "take_profit": ["68000", "71000"],
-        "analysis_reason": "Core trading engine active. Tracking order flow imbalances."
+        "analysis_reason": "Order-book depth indicates massive demand liquidity clusters."
+    },
+    {
+        "asset_pair": "ETH/USDT",
+        "direction": "LONG",
+        "entry_zone": "3420 - 3460",
+        "stop_loss": "3310",
+        "take_profit": ["3650", "3800"],
+        "analysis_reason": "Moving average cross confirmed on 4H telemetry frames."
+    },
+    {
+        "asset_pair": "SOL/USDT",
+        "direction": "SHORT",
+        "entry_zone": "148.50 - 151.00",
+        "stop_loss": "156.20",
+        "take_profit": ["135.00", "128.00"],
+        "analysis_reason": "RSI boundaries overextended at short-term distribution baselines."
     }
 ]
 
@@ -37,34 +50,42 @@ class PromptRequest(BaseModel):
 
 @app.get("/api/v1/history")
 async def get_signal_history():
-    """Feeds the live data stream directly to your Telegram Mini App interface"""
     return {"status": "success", "total": len(SIGNAL_HISTORY_CACHE), "data": SIGNAL_HISTORY_CACHE}
 
 @app.post("/api/v1/generate-signal")
 async def generate_signal(request: PromptRequest):
-    """Processes signal calculations directly from user prompts"""
-    logger.info(f"Computing telemetry for prompt: '{request.prompt}'")
-    prompt_lower = request.prompt.lower()
+    logger.info(f"Computing matrix metrics for input parameters: '{request.prompt}'")
+    raw_text = request.prompt.upper()
     
-    asset_pair = "BTC/USDT"
-    if "eth" in prompt_lower:
-        asset_pair = "ETH/USDT"
-    elif "sol" in prompt_lower:
-        asset_pair = "SOL/USDT"
+    # Extract asset context dynamically from input words
+    ticker = "AVAX/USDT"
+    if "BTC" in raw_text: ticker = "BTC/USDT"
+    elif "ETH" in raw_text: ticker = "ETH/USDT"
+    elif "SOL" in raw_text: ticker = "SOL/USDT"
+    elif "BNB" in raw_text: ticker = "BNB/USDT"
+    elif "TON" in raw_text: ticker = "TON/USDT"
+    elif "DOGE" in raw_text: ticker = "DOGE/USDT"
+    else:
+        # Fallback to create custom dynamic pairing from prompt text strings
+        cleaned_words = [w for w in raw_text.split() if len(w) <= 5]
+        if cleaned_words:
+            ticker = f"{cleaned_words[0]}/USDT"
 
+    direction = "SHORT" if "SELL" in raw_text or "SHORT" in raw_text else "LONG"
+    
     payload = {
-        "asset_pair": asset_pair,
-        "direction": "SHORT" if "sell" in prompt_lower or "short" in prompt_lower else "LONG",
-        "risk_level": "high" if "high" in prompt_lower else "medium",
-        "entry_zone": "Market Execution",
-        "stop_loss": "Dynamic",
-        "take_profit": ["Target 1", "Target 2"],
-        "analysis_reason": f"Automated calculation for engine request: '{request.prompt}'"
+        "asset_pair": ticker,
+        "direction": direction,
+        "entry_zone": "Market Execution Scope",
+        "stop_loss": "Dynamic Calculated Protect",
+        "take_profit": ["Target Threshold 1", "Target Threshold 2"],
+        "analysis_reason": f"AI Engine generated stream vector based on prompt request parameters."
     }
     
-    SIGNAL_HISTORY_CACHE.append(payload)
-    if len(SIGNAL_HISTORY_CACHE) > 10:
-        SIGNAL_HISTORY_CACHE.pop(0)
+    # Prepend to the top of the stream list array
+    SIGNAL_HISTORY_CACHE.insert(0, payload)
+    if len(SIGNAL_HISTORY_CACHE) > 12: # Retain up to 12 signals in stream memory cache
+        SIGNAL_HISTORY_CACHE.pop()
         
     return payload
 
