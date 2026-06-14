@@ -9,9 +9,9 @@ import httpx
 from google import genai
 from google.genai import types
 
-app = FastAPI(title="Phoenix Pure Algorithmic Stream Engine")
+app = FastAPI(title="Phoenix Algorithmic Pure Stream Engine")
 
-# Configure global Cross-Origin Resource Sharing (CORS) for frontends
+# CORS middleware must be configured immediately after app instantiation
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,17 +32,22 @@ if GEMINI_API_KEY:
 else:
     ai_client = None
 
-# --- TELEMETRY SCANNER LAYER ---
+# Anti-blocking headers to ensure high-uptime public streaming
+STANDARD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+# --- PURE LIVE TELEMETRY CORE ---
 
 async def get_live_bybit_top_pairs() -> List[Dict]:
     """
-    Scans the live Bybit V5 Linear public REST API.
-    Isolates the top 5 high-liquidity trading assets by 24h turnover volume dynamically.
+    Directly scans the live Bybit V5 Linear interface.
+    Isolates top trading pairs dynamically by 24h turnover volume.
     """
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=STANDARD_HEADERS) as client:
         try:
             url = "https://api.bybit.com/v5/market/tickers?category=linear"
-            response = await client.get(url, timeout=5.0)
+            response = await client.get(url, timeout=6.0)
             if response.status_code != 200:
                 return []
             
@@ -50,10 +55,10 @@ async def get_live_bybit_top_pairs() -> List[Dict]:
             if not ticker_list:
                 return []
             
-            # Filter and sort by exchange turnover (volume denominated in USD)
+            # Defensive validation against missing turnover metrics
             sorted_tickers = sorted(
-                [t for t in ticker_list if t.get("turnover")], 
-                key=lambda x: float(x["turnover"]), 
+                [t for t in ticker_list if t.get("turnover") is not None], 
+                key=lambda x: float(x["turnover"] or 0), 
                 reverse=True
             )
             
@@ -62,29 +67,29 @@ async def get_live_bybit_top_pairs() -> List[Dict]:
             
             for item in top_5:
                 raw_symbol = item.get("symbol", "")
-                
-                # Standardize trading pair strings (e.g., BTCUSDT -> BTC/USDT)
+                if not raw_symbol:
+                    continue
+                    
                 if raw_symbol.endswith("USDT"):
                     pair_display = f"{raw_symbol[:-4]}/USDT"
                 else:
                     pair_display = raw_symbol
                 
-                last_price = float(item.get("lastPrice", 0))
-                price_change_pct = float(item.get("price24hPcnt", 0)) * 100
+                last_price = float(item.get("lastPrice", 0) or 0)
+                price_change_pct = float(item.get("price24hPcnt", 0) or 0) * 100 
                 
                 if last_price <= 0:
                     continue
                 
-                # --- MATHEMATICAL MOMENTUM VECTOR MATRIX ---
                 if price_change_pct >= 0.2:
                     direction = "BUY / LONG"
-                    stop_loss = last_price * 0.982   # Strict 1.8% support buffer
-                    take_profit = last_price * 1.045  # Target 4.5% profit node
+                    stop_loss = last_price * 0.982   
+                    take_profit = last_price * 1.045  
                     confidence_math = min(99, int(75 + (price_change_pct * 3)))
                 elif price_change_pct <= -0.2:
                     direction = "SELL / SHORT"
-                    stop_loss = last_price * 1.018   # Overhead local resistance capture
-                    take_profit = last_price * 0.955  # Short target exit zone
+                    stop_loss = last_price * 1.018   
+                    take_profit = last_price * 0.955  
                     confidence_math = min(99, int(75 + (abs(price_change_pct) * 3)))
                 else:
                     direction = "BUY / LONG"
@@ -92,7 +97,6 @@ async def get_live_bybit_top_pairs() -> List[Dict]:
                     take_profit = last_price * 1.030
                     confidence_math = 70
 
-                # Precision rules for high-value spot indexes vs minor assets
                 fmt = ".2f" if last_price >= 1.0 else ".6f"
                 
                 processed_signals.append({
@@ -107,87 +111,98 @@ async def get_live_bybit_top_pairs() -> List[Dict]:
                 
             return processed_signals
         except Exception as e:
-            print(f"Bybit Core Node Exception: {str(e)}")
+            print(f"Bybit Core Pipeline Exception: {str(e)}")
             return []
 
 # --- LIVE REST ROUTER ENDPOINTS ---
 
 @app.get("/api/v2/history")
 async def get_algorithmic_signals():
-    """Returns the 5 dynamically calculated market scanner parameters. Zero hardcoded placeholders."""
     signals = await get_live_bybit_top_pairs()
     return {"signals": signals}
 
 @app.get("/api/v2/pairs")
 async def get_all_pairs_matrix():
-    """Pulls current high-volume spot global pricing indexes directly from the network layer."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=STANDARD_HEADERS) as client:
         try:
-            r = await client.get("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=15&page=1", timeout=5.0)
+            r = await client.get("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=15&page=1", timeout=6.0)
             if r.status_code == 200:
                 return [{
                     "id": c.get("id"),
                     "name": c.get("name"),
-                    "symbol": c.get("symbol").upper(),
-                    "price": f"{c.get('current_price'):,.2f}" if c.get("current_price") >= 1 else f"{c.get('current_price'):.6f}",
-                    "change": f"{c.get('price_change_percentage_24h', 0):+.2f}%"
+                    "symbol": str(c.get("symbol", "")).upper(),
+                    "price": f"{c.get('current_price', 0):,.2f}" if c.get("current_price", 0) >= 1 else f"{c.get('current_price', 0):.6f}",
+                    "change": f"{c.get('price_change_percentage_24h', 0) or 0:+.2f}%"
                 } for c in r.json()]
-        except:
-            pass
+        except Exception as e:
+            print(f"CoinGecko Data Node Exception: {e}")
         return []
 
 @app.get("/api/v2/performance")
 async def fetch_performance_matrix():
-    """Calculates systemic variance metrics derived dynamically from aggregate volatility changes."""
     signals = await get_live_bybit_top_pairs()
     if not signals:
         return {"pnl": "0.00%"}
     
-    total_movement = sum(abs(s["raw_change"]) for s in signals)
+    total_movement = sum(abs(s.get("raw_change", 0)) for s in signals)
     calculated_pnl = total_movement / len(signals)
     return {"pnl": f"+{calculated_pnl:.2f}%"}
 
 @app.get("/api/v2/polymarket")
 async def get_live_polymarket_events():
-    """Streams top open sentiment probabilities directly from the Polymarket CLOB router."""
-    async with httpx.AsyncClient() as client:
+    """Fetches contracts dynamically. Enhanced safety fallback array mapping."""
+    async with httpx.AsyncClient(headers=STANDARD_HEADERS) as client:
         try:
-            r = await client.get("https://clob.polymarket.com/markets/simplified", timeout=5.0)
+            r = await client.get("https://clob.polymarket.com/markets/simplified", timeout=6.0)
             if r.status_code == 200:
-                return {"markets": [{
-                    "title": m.get("question"),
-                    "odds": f"{int(float(m.get('outcomePrices', [0.5])[0]) * 100)}%"
-                } for m in r.json()[:5] if m.get("question")]}
-        except: pass
+                markets_data = r.json()
+                output = []
+                for m in markets_data[:5]:
+                    if m and m.get("question"):
+                        prices = m.get("outcomePrices")
+                        # Bulletproof conversion loop if prices is None or empty list
+                        if not prices or not isinstance(prices, list):
+                            prices = ["0.5"]
+                        try:
+                            first_price = float(prices[0] if prices[0] else 0.5)
+                        except (ValueError, TypeError):
+                            first_price = 0.5
+                        
+                        output.append({
+                            "title": m.get("question"),
+                            "odds": f"{int(first_price * 100)}%"
+                        })
+                return {"markets": output}
+        except Exception as e:
+            print(f"Polymarket Data Engine Error: {e}")
         return {"markets": []}
 
 @app.get("/api/v2/news")
 async def fetch_live_news_stream():
-    """Pulls international macro breaking data feeds instantly across standard public wire endpoints."""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(headers=STANDARD_HEADERS) as client:
         try:
-            r = await client.get("https://cryptopanic.com/api/v1/posts/?public=true", timeout=5.0)
+            r = await client.get("https://cryptopanic.com/api/v1/posts/?public=true", timeout=6.0)
             if r.status_code == 200:
-                return {"news": [{"title": item.get("title"), "source": item.get("source", {}).get("domain", "CryptoPanic")} for item in r.json().get("results", [])[:4]]}
-        except: pass
+                results = r.json().get("results", [])
+                return {"news": [{"title": item.get("title", "Market Update"), "source": item.get("source", {}).get("domain", "CryptoPanic")} for item in results[:4]]}
+        except Exception as e:
+            print(f"CryptoPanic Wire Connection Error: {e}")
         return {"news": []}
 
 @app.post("/api/v2/chat")
 async def handle_chat(request: PromptRequest):
-    """Feeds processing strings straight into the Gemini AI core backend."""
     if not ai_client:
-        return {"reply": "AI Interface Engine Offline. Add GEMINI_API_KEY inside Render parameters."}
+        return {"reply": "AI Engine offline. Verify GEMINI_API_KEY environment configuration inside your hosting dashboard."}
     try:
         response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=request.prompt,
             config=types.GenerateContentConfig(
-                system_instruction="You are the live technical oracle module for the Phoenix terminal. Run technical analysis parameters directly against user data streams. No pleasantries.",
+                system_instruction="You are the live technical processing oracle for the Phoenix terminal. Run technical analytics parameters directly against raw real-time user requests. No introductory remarks.",
                 max_output_tokens=250,
                 temperature=0.2
             )
         )
         return {"reply": response.text.strip()}
     except Exception as e:
-        return {"reply": f"Processing Exception: {str(e)}"}
-        
+        return {"reply": f"Processing Pipeline Vector Fault: {str(e)}"}
