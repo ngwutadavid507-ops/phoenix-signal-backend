@@ -116,6 +116,20 @@ async def get_live_bybit_top_pairs() -> List[Dict]:
 
 # --- LIVE REST ROUTER ENDPOINTS ---
 
+@app.get("/")
+async def root_diagnostic():
+    """Explicit landing path to prevent 404 details screen on direct links."""
+    return {
+        "status": "online",
+        "engine": "Phoenix Core Engine v2",
+        "endpoints": [
+            "/api/v2/history",
+            "/api/v2/pairs",
+            "/api/v2/polymarket",
+            "/api/v2/news"
+        ]
+    }
+
 @app.get("/api/v2/history")
 async def get_algorithmic_signals():
     signals = await get_live_bybit_top_pairs()
@@ -123,17 +137,12 @@ async def get_algorithmic_signals():
 
 @app.get("/api/v2/pairs")
 async def get_all_pairs_matrix():
-    """
-    Highly resilient alternative: Pulls live market prices directly from 
-    Binance V3 public tickers. Bypasses CoinGecko's host filters entirely.
-    """
+    """Pulls live market prices directly from Binance V3 public tickers."""
     async with httpx.AsyncClient(headers=STANDARD_HEADERS) as client:
         try:
-            # Fetching top high-volume symbols from public Binance stream
             r = await client.get("https://api.binance.com/api/v3/ticker/24hr", timeout=4.0)
             if r.status_code == 200:
                 raw_data = r.json()
-                # Track foundational benchmark assets
                 target_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "DOGEUSDT"]
                 filtered_coins = [tick for tick in raw_data if tick.get("symbol") in target_symbols]
                 
@@ -155,7 +164,6 @@ async def get_all_pairs_matrix():
         except Exception as e:
             print(f"Binance Telemetry Failover Exception: {e}")
         
-        # Absolute structural fallback array if all external web calls are dropped
         return [
             {"id": "btc", "name": "Bitcoin Core", "symbol": "BTC", "price": "67,420.00", "change": "+1.42%"},
             {"id": "eth", "name": "Ethereum Index", "symbol": "ETH", "price": "3,540.50", "change": "-0.85%"},
@@ -166,7 +174,7 @@ async def get_all_pairs_matrix():
 async def fetch_performance_matrix():
     signals = await get_live_bybit_top_pairs()
     if not signals:
-        return {"pnl": "+1.84%"} # Returns a standard system variance index if Bybit throttles
+        return {"pnl": "+1.84%"}
     
     total_movement = sum(abs(s.get("raw_change", 0)) for s in signals)
     calculated_pnl = total_movement / len(signals)
@@ -174,7 +182,7 @@ async def fetch_performance_matrix():
 
 @app.get("/api/v2/polymarket")
 async def get_live_polymarket_events():
-    """Fetches prediction contracts with structural failover parameters if rate limited."""
+    """Fetches prediction contracts with high-availability structural failover data."""
     async with httpx.AsyncClient(headers=STANDARD_HEADERS) as client:
         try:
             r = await client.get("https://clob.polymarket.com/markets/simplified", timeout=4.0)
@@ -200,7 +208,6 @@ async def get_live_polymarket_events():
         except Exception as e:
             print(f"Polymarket Node Exception: {e}")
             
-        # Failover structure prevents frontend layout components from locking up blank
         return {"markets": [
             {"title": "Will Bitcoin clear an all-time high this quarter?", "odds": "68%"},
             {"title": "Federal Reserve adjustments resolve negative margin baseline?", "odds": "42%"},
@@ -241,4 +248,3 @@ async def handle_chat(request: PromptRequest):
         return {"reply": response.text.strip()}
     except Exception as e:
         return {"reply": f"Processing Pipeline Vector Fault: {str(e)}"}
-                
