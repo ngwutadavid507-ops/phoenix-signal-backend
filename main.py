@@ -11,25 +11,29 @@ from google.genai import types
 
 app = FastAPI(title="Phoenix Algorithmic Bybit Engine")
 
-# Permissive CORS layer for direct mobile/webview alignment
+# Aggressive CORS Configuration to clear out mobile webview network preflight blocks
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 class PromptRequest(BaseModel):
     prompt: str
 
-# Gemini Core Initialization
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-if GEMINI_API_KEY:
-    os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
-    ai_client = genai.Client()
+# EXPLICIT INITIALIZATION: Forcing the API key directly into the client constructor
+API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+
+if API_KEY:
+    # Passing the key explicitly solves the 'API key not found' 400 error perfectly
+    ai_client = genai.Client(api_key=API_KEY)
+    print("🚀 Phoenix AI Engine Initialized successfully with explicit credentials.")
 else:
     ai_client = None
+    print("⚠️ Warning: GEMINI_API_KEY environment variable is empty on Render environment settings.")
 
 BYBIT_PUBLIC_URL = "https://api.bybit.com/v5/market/tickers?category=linear"
 STANDARD_HEADERS = {
@@ -39,17 +43,19 @@ STANDARD_HEADERS = {
 
 @app.get("/")
 async def root_diagnostic():
-    return {"status": "online", "engine": "Phoenix Bybit Core"}
+    return {
+        "status": "online", 
+        "engine": "Phoenix Bybit Core",
+        "ai_status": "configured" if ai_client else "missing_key"
+    }
 
 @app.get("/api/v2/history")
 async def get_algorithmic_signals():
-    """Pulls live data from Bybit and builds automated mock signal parameters."""
     async with httpx.AsyncClient(headers=STANDARD_HEADERS, follow_redirects=True) as client:
         try:
-            response = await client.get(BYBIT_PUBLIC_URL, timeout=5.0)
+            response = await client.get(BYBIT_PUBLIC_URL, timeout=6.0)
             if response.status_code == 200:
                 ticker_list = response.json().get("result", {}).get("list", [])
-                # Take top volume symbols ending with USDT
                 usdt_pairs = [t for t in ticker_list if str(t.get("symbol")).endswith("USDT")][:5]
                 
                 processed = []
@@ -79,14 +85,11 @@ async def get_algorithmic_signals():
 
 @app.get("/api/v2/pairs")
 async def get_all_pairs_matrix():
-    """Fetches high-volume core tokens straight from live Bybit ticks."""
     async with httpx.AsyncClient(headers=STANDARD_HEADERS, follow_redirects=True) as client:
         try:
-            response = await client.get(BYBIT_PUBLIC_URL, timeout=5.0)
+            response = await client.get(BYBIT_PUBLIC_URL, timeout=6.0)
             if response.status_code == 200:
                 ticker_list = response.json().get("result", {}).get("list", [])
-                
-                # Filter specific major tokens
                 target_assets = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT"]
                 filtered = [t for t in ticker_list if t.get("symbol") in target_assets]
                 
@@ -126,22 +129,20 @@ async def fetch_live_news_stream():
         {"title": "Volatility clustering detected near major perpetual contract clusters.", "source": "Phoenix Data Wire"}
     ]}
 
-# CRITICAL FIX: Changed from @app.get to @app.post to stop the 405 Method Error
 @app.post("/api/v2/chat")
 async def handle_chat(request: PromptRequest):
     if not ai_client:
-        return {"reply": "AI Engine initialization fault. Verify GEMINI_API_KEY setup on Render."}
+        return {"reply": "AI Core Error: GEMINI_API_KEY environment variable is missing or blank on Render dashboard settings."}
     try:
         response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=request.prompt,
             config=types.GenerateContentConfig(
-                system_instruction="You are the Phoenix Terminal automated oracle. Provide precise market telemetry analyses. Be concise.",
+                system_instruction="You are the Phoenix Terminal automated algorithmic oracle. Provide precise market telemetry metrics or code logic profiles concisely.",
                 max_output_tokens=200,
                 temperature=0.2
             )
         )
         return {"reply": response.text.strip()}
     except Exception as e:
-        return {"reply": f"AI Engine Exception Vector: {str(e)}"}
-                
+        return {"reply": f"AI Engine Connection Pipeline Exception: {str(e)}"}
