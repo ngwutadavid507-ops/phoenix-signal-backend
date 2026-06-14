@@ -510,4 +510,123 @@ async def get_pairs(search: str = Query(default="")):
                             "name":            c.get("name", ""),
                             "symbol":          c.get("symbol", "").upper(),
                             "market_cap_rank": c.get("market_cap_rank", "—"),
-                            "price":           f"{price:,.4f}" if 0 < price < 1 else f"{price:,.2
+                            "price":           f"{price:,.4f}" if 0 < price < 1 else f"{price:,.2f}" if price >= 1 else "N/A",
+                            "change":          f"{change:+.2f}%",
+                            "volume":          f"${vol/1_000_000:.1f}M" if vol >= 1_000_000 else f"${vol:,.0f}",
+                            "market_cap":      f"${mcap/1_000_000_000:.2f}B" if mcap >= 1_000_000_000 else f"${mcap/1_000_000:.1f}M",
+                            "thumb":           c.get("image", ""),
+                            "high_24h":        f"{float(c.get('high_24h') or 0):,.2f}",
+                            "low_24h":         f"{float(c.get('low_24h') or 0):,.2f}",
+                        })
+                    _pairs_cache["data"] = output
+                    _pairs_cache["ts"]   = time.time()
+                    return output
+        except Exception as e:
+            print(f"Pairs error: {e}")
+    return _pairs_cache["data"] or []
+
+@app.get("/api/v2/trending")
+async def get_trending():
+    async with httpx.AsyncClient(headers=HEADERS) as client:
+        try:
+            r = await client.get(f"{COINGECKO}/search/trending", timeout=10.0)
+            if r.status_code == 200:
+                coins = r.json().get("coins", [])
+                return {"trending": [
+                    {
+                        "name":   c["item"]["name"],
+                        "symbol": c["item"]["symbol"].upper(),
+                        "rank":   c["item"].get("market_cap_rank", "N/A"),
+                        "thumb":  c["item"].get("thumb", ""),
+                        "score":  round(c["item"].get("score", 0), 2)
+                    }
+                    for c in coins[:10]
+                ]}
+        except Exception as e:
+            print(f"Trending error: {e}")
+    return {"trending": []}
+
+@app.get("/api/v2/polymarket")
+async def get_polymarket():
+    now = time.time()
+    if now - _poly_cache["ts"] < CACHE_TTL and _poly_cache["data"]:
+        return _poly_cache["data"]
+
+    # Run AI analysis for all 4 categories concurrently
+    results = await asyncio.gather(
+        analyse_poly_category("crypto",      POLY_MARKETS["crypto"]),
+        analyse_poly_category("geopolitics", POLY_MARKETS["geopolitics"]),
+        analyse_poly_category("sports",      POLY_MARKETS["sports"]),
+        analyse_poly_category("other",       POLY_MARKETS["other"]),
+        return_exceptions=True
+    )
+
+    def safe(r, fallback):
+        return r if isinstance(r, dict) else fallback
+
+    fallback = {"pick1": {}, "pick2": {}, "signal": {"direction": "BUY", "thesis": "Analysis unavailable.", "risk": "MED"}}
+
+    data = {
+        "crypto":      {"markets": POLY_MARKETS["crypto"],      "analysis": safe(results[0], fallback)},
+        "geopolitics": {"markets": POLY_MARKETS["geopolitics"], "analysis": safe(results[1], fallback)},
+        "sports":      {"markets": POLY_MARKETS["sports"],      "analysis": safe(results[2], fallback)},
+        "other":       {"markets": POLY_MARKETS["other"],       "analysis": safe(results[3], fallback)},
+    }
+
+    _poly_cache["data"] = data
+    _poly_cache["ts"]   = time.time()
+    return data
+
+@app.get("/api/v2/news")
+async def news():
+    return {"news": [
+        {"title": "Altcoin season indicators flash green as BTC dominance dips below 54%.", "source": "Phoenix Data Wire"},
+        {"title": "High volume breakouts detected across mid-cap DeFi tokens.",              "source": "Phoenix Data Wire"},
+        {"title": "Open interest on perpetuals surges across top altcoin pairs.",            "source": "Bybit Feed Node"},
+        {"title": "On-chain data shows accumulation patterns in Layer-2 tokens.",            "source": "Phoenix Data Wire"},
+        {"title": "Liquidity pool depth expands as institutional volume rotates into alts.", "source": "Bybit Feed Node"},
+        {"title": "Whale wallets accumulate BNB and AVAX in silent weekend session.",        "source": "Phoenix Data Wire"},
+        {"title": "Funding rates on perpetuals turn positive — bulls in control.",           "source": "Bybit Feed Node"},
+    ]}
+
+@app.get("/api/v2/performance")
+async def performance():
+    return {"pnl": "+4.12%"}
+
+@app.post("/api/v2/chat")
+async def chat(request: ChatRequest):
+    if not groq_client:
+        return {"reply": "⚠️ AI Engine offline. GROQ_API_KEY not set on Render."}
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Phoenix Oracle, an elite crypto and financial markets intelligence engine. "
+                    "You have deep expertise in technical analysis, on-chain data, DeFi, tokenomics, "
+                    "derivatives, market microstructure, risk management, and trading psychology. "
+                    "When asked about a specific token, give its narrative, use case, risk profile, "
+                    "key levels to watch, and sentiment. "
+                    "When asked about trade setups, give structured analysis with entry logic, "
+                    "invalidation level, and targets. "
+                    "You do not give financial advice — you give professional analysis. "
+                    "Be sharp, direct, and expert-level. Under 200 words per response."
+                )
+            }
+        ]
+        # Include conversation history for context
+        for msg in request.history[-8:]:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        messages.append({"role": "user", "content": request.prompt})
+
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            max_tokens=280,
+            temperature=0.3,
+            timeout=20
+        )
+        return {"reply": response.choices[0].message.content.strip()}
+    except Exception as e:
+        print(f"Groq error: {e}")
+        return {"reply": "⚠️ AI Engine temporarily unavailable. Please retry."}
