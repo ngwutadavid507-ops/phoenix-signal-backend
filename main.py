@@ -2,13 +2,15 @@ import os
 import asyncio
 import time
 import json
+import hmac
+import hashlib
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 from groq import Groq
 
-app = FastAPI(title="Phoenix Signal Backend v5")
+app = FastAPI(title="Phoenix Signal Backend v6")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,9 +25,13 @@ class ChatRequest(BaseModel):
     prompt: str
     history: list = []
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-groq_client  = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-print("🚀 Groq ready." if groq_client else "⚠️ GROQ_API_KEY missing.")
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "").strip()
+BYBIT_API_KEY   = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET= os.getenv("BYBIT_API_SECRET", "").strip()
+
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+print("🚀 Groq ready."        if groq_client    else "⚠️ GROQ_API_KEY missing.")
+print("🔑 Bybit API ready."   if BYBIT_API_KEY  else "⚠️ BYBIT_API_KEY missing.")
 
 BINANCE = "https://api.binance.com/api/v3"
 BYBIT   = "https://api.bybit.com/v5/market"
@@ -49,17 +55,46 @@ _poly_cache   = {"data": {}, "ts": 0}
 CACHE_TTL     = 300
 POLY_TTL      = 600
 
+# ─── BYBIT AUTH HELPER ────────────────────────────────────
+
+def bybit_headers(params: dict = {}) -> dict:
+    """Generate authenticated Bybit headers."""
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        return HEADERS
+    ts        = str(int(time.time() * 1000))
+    recv_wind = "5000"
+    param_str = ts + BYBIT_API_KEY + recv_wind + "&".join(f"{k}={v}" for k,v in sorted(params.items()))
+    signature = hmac.new(BYBIT_API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+    return {
+        **HEADERS,
+        "X-BAPI-API-KEY":       BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP":     ts,
+        "X-BAPI-SIGN":          signature,
+        "X-BAPI-RECV-WINDOW":   recv_wind,
+    }
+
+def safe_float(val, default=0.0) -> float:
+    """Safely convert any value to float."""
+    try:
+        if val is None or val == "" or val == "N/A":
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 # ─── BYBIT FUTURES SYMBOLS ────────────────────────────────
 
 async def get_bybit_symbols() -> set:
     now = time.time()
     if now - _bybit_cache["ts"] < CACHE_TTL and _bybit_cache["symbols"]:
         return _bybit_cache["symbols"]
-    async with httpx.AsyncClient(headers=HEADERS) as client:
+
+    async with httpx.AsyncClient() as client:
         try:
             r = await client.get(
                 f"{BYBIT}/instruments-info",
                 params={"category": "linear", "limit": 1000},
+                headers=HEADERS,
                 timeout=15.0
             )
             if r.status_code == 200:
@@ -71,7 +106,7 @@ async def get_bybit_symbols() -> set:
                 }
                 _bybit_cache["symbols"] = syms
                 _bybit_cache["ts"]      = time.time()
-                print(f"✅ Bybit: {len(syms)} active futures")
+                print(f"✅ Bybit: {len(syms)} active futures loaded")
                 return syms
         except Exception as e:
             print(f"Bybit instruments error: {e}")
@@ -80,10 +115,9 @@ async def get_bybit_symbols() -> set:
 # ─── TECHNICAL ANALYSIS ───────────────────────────────────
 
 def compute_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-    gains = [max(prices[i]-prices[i-1], 0) for i in range(len(prices)-period, len(prices))]
-    losses= [max(prices[i-1]-prices[i], 0) for i in range(len(prices)-period, len(prices))]
+    if len(prices) < period + 1: return 50.0
+    gains  = [max(prices[i]-prices[i-1], 0) for i in range(len(prices)-period, len(prices))]
+    losses = [max(prices[i-1]-prices[i], 0) for i in range(len(prices)-period, len(prices))]
     ag = sum(gains)/period; al = sum(losses)/period
     return round(100-(100/(1+ag/al)), 2) if al > 0 else 100.0
 
@@ -97,8 +131,8 @@ def compute_ema(prices, period):
 
 def compute_macd(prices):
     if len(prices) < 26: return 0, 0
-    return round(compute_ema(prices,12)-compute_ema(prices,26), 8), \
-           round(compute_ema(prices[-9:], min(9,len(prices[-9:]))), 8)
+    return (round(compute_ema(prices,12)-compute_ema(prices,26), 8),
+            round(compute_ema(prices[-9:], min(9,len(prices[-9:]))), 8))
 
 def compute_bollinger(prices, period=20):
     if len(prices) < period:
@@ -108,36 +142,37 @@ def compute_bollinger(prices, period=20):
     return round(mid+2*std,8), round(mid,8), round(mid-2*std,8)
 
 def analyse_coin(closes, volumes, symbol, price):
-    if len(closes) < 30: return None
-    rsi = compute_rsi(closes)
-    ema20 = compute_ema(closes, 20)
-    ema50 = compute_ema(closes, 50) if len(closes)>=50 else ema20
-    macd_l, sig_l = compute_macd(closes)
-    bb_up, bb_mid, bb_lo = compute_bollinger(closes)
-    avg_vol  = sum(volumes[-14:])/14 if len(volumes)>=14 else (volumes[-1] if volumes else 1)
-    vol_spike = (volumes[-1] if volumes else 0) > avg_vol*1.4
+    if len(closes) < 30 or price <= 0: return None
+
+    rsi                   = compute_rsi(closes)
+    ema20                 = compute_ema(closes, 20)
+    ema50                 = compute_ema(closes, 50) if len(closes)>=50 else ema20
+    macd_l, sig_l         = compute_macd(closes)
+    bb_up, bb_mid, bb_lo  = compute_bollinger(closes)
+    avg_vol   = sum(volumes[-14:])/14 if len(volumes)>=14 else (volumes[-1] if volumes else 1)
+    vol_spike = (volumes[-1] if volumes else 0) > avg_vol * 1.4
 
     bull, bear, reasons = 0, 0, []
 
-    if rsi < 35:   bull+=1; reasons.append(f"RSI oversold at {rsi} — reversal likely")
-    elif rsi > 65: bear+=1; reasons.append(f"RSI overbought at {rsi} — pullback likely")
-    elif rsi < 45: bull+=0.5
-    elif rsi > 55: bear+=0.5
+    if rsi < 35:    bull+=1; reasons.append(f"RSI oversold at {rsi} — reversal likely")
+    elif rsi > 65:  bear+=1; reasons.append(f"RSI overbought at {rsi} — pullback likely")
+    elif rsi < 45:  bull+=0.5
+    elif rsi > 55:  bear+=0.5
 
-    if ema20 > ema50*1.001:   bull+=1; reasons.append("EMA20 above EMA50 — uptrend confirmed")
-    elif ema20 < ema50*0.999: bear+=1; reasons.append("EMA20 below EMA50 — downtrend confirmed")
+    if ema20 > ema50*1.001:    bull+=1; reasons.append("EMA20 above EMA50 — uptrend confirmed")
+    elif ema20 < ema50*0.999:  bear+=1; reasons.append("EMA20 below EMA50 — downtrend confirmed")
 
-    if macd_l > sig_l:   bull+=1; reasons.append("MACD bullish crossover" + (" above zero" if macd_l>0 else ""))
-    elif macd_l < sig_l: bear+=1; reasons.append("MACD bearish crossover" + (" below zero" if macd_l<0 else ""))
+    if macd_l > sig_l:    bull+=1; reasons.append("MACD bullish crossover" + (" above zero" if macd_l>0 else ""))
+    elif macd_l < sig_l:  bear+=1; reasons.append("MACD bearish crossover" + (" below zero" if macd_l<0 else ""))
 
-    if price <= bb_lo*1.008:   bull+=1; reasons.append("Price at lower Bollinger Band — bounce setup")
-    elif price >= bb_up*0.992: bear+=1; reasons.append("Price at upper Bollinger Band — rejection setup")
-    elif price > bb_mid:       bull+=0.5; reasons.append("Price above BB midline with momentum")
-    else:                      bear+=0.5; reasons.append("Price below BB midline losing support")
+    if price <= bb_lo*1.008:    bull+=1; reasons.append("Price at lower Bollinger Band — bounce setup")
+    elif price >= bb_up*0.992:  bear+=1; reasons.append("Price at upper Bollinger Band — rejection setup")
+    elif price > bb_mid:        bull+=0.5; reasons.append("Price above BB midline with momentum")
+    else:                       bear+=0.5; reasons.append("Price below BB midline losing support")
 
     if len(closes) >= 5:
         mom = (closes[-1]-closes[-5])/closes[-5]*100
-        if mom > 2:   bull+=1; reasons.append(f"Strong 5-period momentum +{mom:.1f}%")
+        if mom > 2:    bull+=1; reasons.append(f"Strong 5-period momentum +{mom:.1f}%")
         elif mom < -2: bear+=1; reasons.append(f"Negative 5-period momentum {mom:.1f}%")
 
     if vol_spike:
@@ -148,14 +183,16 @@ def analyse_coin(closes, volumes, symbol, price):
     score     = bull if direction=="LONG" else bear
     if score < 3: return None
 
-    rsi_b  = max(0,(50-rsi)/4) if direction=="LONG" else max(0,(rsi-50)/4)
+    rsi_b  = max(0,(50-rsi)/4)   if direction=="LONG"  else max(0,(rsi-50)/4)
     macd_b = 3 if (direction=="LONG" and macd_l>0) or (direction=="SHORT" and macd_l<0) else 0
     conf   = min(96, int(64+(score/6)*28+rsi_b+macd_b))
     if conf < 68: return None
 
     p = price
-    sl,tp1,tp2,tp3 = (round(p*0.99,8),round(p*1.015,8),round(p*1.026,8),round(p*1.042,8)) if direction=="LONG" \
-                  else (round(p*1.01,8),round(p*0.985,8),round(p*0.974,8),round(p*0.958,8))
+    if direction=="LONG":
+        sl,tp1,tp2,tp3 = round(p*0.99,8),round(p*1.015,8),round(p*1.026,8),round(p*1.042,8)
+    else:
+        sl,tp1,tp2,tp3 = round(p*1.01,8),round(p*0.985,8),round(p*0.974,8),round(p*0.958,8)
 
     rr = round(abs(tp2-p)/abs(p-sl),1) if abs(p-sl)>0 else 0
 
@@ -177,22 +214,29 @@ def analyse_coin(closes, volumes, symbol, price):
 async def fetch_binance_ohlcv(symbol, client):
     try:
         r = await client.get(f"{BINANCE}/klines",
-            params={"symbol":symbol,"interval":"1d","limit":90},timeout=10.0,headers=HEADERS)
-        if r.status_code==200:
-            c=r.json(); return [float(x[4]) for x in c],[float(x[5]) for x in c]
-    except Exception as e: print(f"Binance OHLCV {symbol}: {e}")
-    return [],[]
+            params={"symbol":symbol,"interval":"1d","limit":90},
+            timeout=12.0, headers=HEADERS)
+        if r.status_code == 200:
+            c = r.json()
+            return [safe_float(x[4]) for x in c], [safe_float(x[5]) for x in c]
+    except Exception as e:
+        print(f"Binance OHLCV {symbol}: {e}")
+    return [], []
 
 async def fetch_bybit_ohlcv(symbol, client):
     try:
+        params = {"category":"linear","symbol":symbol,"interval":"D","limit":90}
         r = await client.get(f"{BYBIT}/kline",
-            params={"category":"linear","symbol":symbol,"interval":"D","limit":90},
-            timeout=10.0,headers=HEADERS)
-        if r.status_code==200:
-            d=r.json().get("result",{}).get("list",[])
-            return [float(c[4]) for c in reversed(d)],[float(c[5]) for c in reversed(d)]
-    except Exception as e: print(f"Bybit OHLCV {symbol}: {e}")
-    return [],[]
+            params=params, timeout=12.0,
+            headers=bybit_headers(params))
+        if r.status_code == 200:
+            d = r.json().get("result",{}).get("list",[])
+            closes  = [safe_float(c[4]) for c in reversed(d)]
+            volumes = [safe_float(c[5]) for c in reversed(d)]
+            return closes, volumes
+    except Exception as e:
+        print(f"Bybit OHLCV {symbol}: {e}")
+    return [], []
 
 # ─── SIGNALS ──────────────────────────────────────────────
 
@@ -203,66 +247,76 @@ async def generate_signals():
 
     bybit_syms = await get_bybit_symbols()
 
-    async with httpx.AsyncClient(headers=HEADERS) as client:
+    async with httpx.AsyncClient() as client:
         try:
-            r = await client.get(f"{BINANCE}/ticker/24hr", timeout=15.0)
+            r = await client.get(f"{BINANCE}/ticker/24hr", timeout=15.0, headers=HEADERS)
             tickers = r.json() if r.status_code==200 else []
         except Exception as e:
             print(f"Binance ticker: {e}"); return _signal_cache["data"] or []
 
         candidates = []
         for t in tickers:
-            sym = t.get("symbol","")
+            sym   = t.get("symbol","")
             if not sym.endswith("USDT"): continue
-            base = sym[:-4]
+            base  = sym[:-4]
             if base in EXCLUDED_BASE: continue
             if any(f in base for f in FIAT_STRINGS): continue
             if bybit_syms and sym not in bybit_syms: continue
-            vol   = float(t.get("quoteVolume",0) or 0)
-            price = float(t.get("lastPrice",0) or 0)
+            vol   = safe_float(t.get("quoteVolume"))
+            price = safe_float(t.get("lastPrice"))
             if vol < 2_000_000 or price <= 0: continue
             candidates.append({"symbol":sym,"base":base,"price":price,"volume":vol})
 
         candidates.sort(key=lambda x: x["volume"], reverse=True)
         candidates = candidates[:30]
+        print(f"Signal candidates: {len(candidates)}")
 
         signals = []
         for coin in candidates:
             sym,base,price = coin["symbol"],coin["base"],coin["price"]
             closes,volumes = await fetch_binance_ohlcv(sym, client)
-            if len(closes)<30:
+            if len(closes) < 30:
                 closes,volumes = await fetch_bybit_ohlcv(sym, client)
-            if len(closes)<30:
+            if len(closes) < 30:
                 await asyncio.sleep(0.2); continue
-            result = analyse_coin(closes,volumes,base,price)
-            if result: signals.append(result)
+            result = analyse_coin(closes, volumes, base, price)
+            if result:
+                signals.append(result)
+                print(f"✅ Signal: {base} {result['direction']} {result['confidence']}")
             await asyncio.sleep(0.15)
-            if len(signals)>=10: break
+            if len(signals) >= 10: break
 
-        signals.sort(key=lambda x:int(x["confidence"].replace("%","")),reverse=True)
-        _signal_cache["data"]=signals; _signal_cache["ts"]=time.time()
+        signals.sort(key=lambda x:int(x["confidence"].replace("%","")), reverse=True)
+        _signal_cache["data"] = signals
+        _signal_cache["ts"]   = time.time()
+        print(f"Signals generated: {len(signals)}")
         return signals
 
-# ─── LIVE PAIRS (Bybit linear tickers) ───────────────────
+# ─── LIVE PAIRS ───────────────────────────────────────────
 
 async def fetch_live_pairs(search: str = ""):
     now = time.time()
     if not search and now-_pairs_cache["ts"]<CACHE_TTL and _pairs_cache["data"]:
         return _pairs_cache["data"]
 
-    async with httpx.AsyncClient(headers=HEADERS) as client:
+    async with httpx.AsyncClient() as client:
         try:
-            # Fetch ALL linear tickers from Bybit — no search param, filter locally
+            # Fetch with auth if available
+            params = {"category": "linear"}
             r = await client.get(
                 f"{BYBIT}/tickers",
-                params={"category": "linear"},
+                params=params,
+                headers=bybit_headers(params),
                 timeout=15.0
             )
-            if r.status_code != 200:
-                raise Exception(f"Bybit tickers HTTP {r.status_code}")
+            print(f"Bybit tickers status: {r.status_code}")
 
-            tickers = r.json().get("result", {}).get("list", [])
-            print(f"Bybit tickers received: {len(tickers)}")
+            if r.status_code != 200:
+                raise Exception(f"Bybit returned {r.status_code}: {r.text[:200]}")
+
+            raw     = r.json()
+            tickers = raw.get("result", {}).get("list", [])
+            print(f"Bybit raw tickers count: {len(tickers)}")
 
             output = []
             for t in tickers:
@@ -272,41 +326,51 @@ async def fetch_live_pairs(search: str = ""):
                 if base in EXCLUDED_BASE: continue
                 if any(f in base for f in FIAT_STRINGS): continue
 
-                price    = float(t.get("lastPrice",0) or 0)
-                change   = float(t.get("price24hPcnt",0) or 0)*100
-                vol      = float(t.get("turnover24h",0) or 0)
-                high     = float(t.get("highPrice24h",0) or 0)
-                low      = float(t.get("lowPrice24h",0) or 0)
-                funding  = t.get("fundingRate","")
-                oi       = float(t.get("openInterest",0) or 0)
-                mark     = float(t.get("markPrice",0) or 0)
-                bid      = float(t.get("bid1Price",0) or 0)
-                ask      = float(t.get("ask1Price",0) or 0)
+                # Use safe_float for ALL fields — Bybit returns empty strings
+                price   = safe_float(t.get("lastPrice"))
+                change  = safe_float(t.get("price24hPcnt")) * 100
+                vol     = safe_float(t.get("turnover24h"))
+                high    = safe_float(t.get("highPrice24h"))
+                low     = safe_float(t.get("lowPrice24h"))
+                funding = t.get("fundingRate","")
+                oi      = safe_float(t.get("openInterest"))
+                mark    = safe_float(t.get("markPrice"))
+                bid     = safe_float(t.get("bid1Price"))
+                ask     = safe_float(t.get("ask1Price"))
 
-                if price<=0: continue
+                # Only skip if truly no price at all
+                if price <= 0 and mark <= 0:
+                    continue
 
-                # Apply search filter locally
+                # Use mark price as fallback if lastPrice is 0
+                display_price = price if price > 0 else mark
+
                 if search and search.upper() not in base.upper():
                     continue
 
                 def fp(v):
-                    if v<=0: return "N/A"
-                    if v<0.0001: return f"{v:.8f}"
-                    if v<0.01:   return f"{v:.6f}"
-                    if v<1:      return f"{v:.4f}"
-                    if v<1000:   return f"{v:,.3f}"
+                    if v <= 0:      return "—"
+                    if v < 0.0001:  return f"{v:.8f}"
+                    if v < 0.01:    return f"{v:.6f}"
+                    if v < 1:       return f"{v:.4f}"
+                    if v < 1000:    return f"{v:,.3f}"
                     return f"{v:,.2f}"
+
+                fund_str = "—"
+                if funding and funding != "":
+                    try: fund_str = f"{float(funding)*100:.4f}%"
+                    except: pass
 
                 output.append({
                     "symbol":       base,
                     "pair":         sym,
-                    "price":        fp(price),
+                    "price":        fp(display_price),
                     "change":       f"{change:+.2f}%",
-                    "volume":       f"${vol/1_000_000:.1f}M" if vol>=1_000_000 else f"${vol:,.0f}",
+                    "volume":       f"${vol/1_000_000:.1f}M" if vol>=1_000_000 else (f"${vol:,.0f}" if vol>0 else "—"),
                     "high_24h":     fp(high),
                     "low_24h":      fp(low),
-                    "funding_rate": f"{float(funding)*100:.4f}%" if funding else "N/A",
-                    "open_interest":f"${oi/1_000_000:.1f}M" if oi>=1_000_000 else f"{oi:,.0f}",
+                    "funding_rate": fund_str,
+                    "open_interest":f"${oi/1_000_000:.1f}M" if oi>=1_000_000 else (f"{oi:,.0f}" if oi>0 else "—"),
                     "mark_price":   fp(mark),
                     "bid":          fp(bid),
                     "ask":          fp(ask),
@@ -315,7 +379,7 @@ async def fetch_live_pairs(search: str = ""):
 
             output.sort(key=lambda x: x["vol_raw"], reverse=True)
             result = output if search else output[:80]
-            print(f"Pairs returning: {len(result)} (search='{search}')")
+            print(f"Pairs output: {len(result)} (search='{search}')")
 
             if not search:
                 _pairs_cache["data"] = result
@@ -324,348 +388,106 @@ async def fetch_live_pairs(search: str = ""):
             return result
 
         except Exception as e:
-            print(f"Pairs error: {e}")
+            print(f"Pairs fetch error: {e}")
+            import traceback; traceback.print_exc()
+
     return _pairs_cache["data"] or []
 
-# ─── POLYMARKET LIVE ──────────────────────────────────────
+# ─── TRENDING (Bybit top gainers) ─────────────────────────
+
+async def fetch_trending():
+    async with httpx.AsyncClient() as client:
+        try:
+            params = {"category": "linear"}
+            r = await client.get(
+                f"{BYBIT}/tickers",
+                params=params,
+                headers=bybit_headers(params),
+                timeout=12.0
+            )
+            tickers = r.json().get("result",{}).get("list",[]) if r.status_code==200 else []
+
+            gainers = []
+            for t in tickers:
+                sym = t.get("symbol","")
+                if not sym.endswith("USDT"): continue
+                base   = sym[:-4]
+                if base in EXCLUDED_BASE: continue
+                if any(f in base for f in FIAT_STRINGS): continue
+                change = safe_float(t.get("price24hPcnt")) * 100
+                price  = safe_float(t.get("lastPrice"))
+                vol    = safe_float(t.get("turnover24h"))
+                if vol < 1_000_000 or (price <= 0 and safe_float(t.get("markPrice")) <= 0):
+                    continue
+                gainers.append({
+                    "name":   base,
+                    "symbol": base,
+                    "change": f"{change:+.2f}%",
+                    "volume": f"${vol/1_000_000:.1f}M",
+                    "price":  f"{price:.4f}" if 0<price<1 else f"{price:,.2f}",
+                    "rank":   "—",
+                    "thumb":  "",
+                    "change_raw": change
+                })
+
+            gainers.sort(key=lambda x: x["change_raw"], reverse=True)
+            for g in gainers: g.pop("change_raw", None)
+            return {"trending": gainers[:10]}
+
+        except Exception as e:
+            print(f"Trending error: {e}")
+    return {"trending": []}
+
+# ─── POLYMARKET ───────────────────────────────────────────
 
 POLY_CATEGORIES = {
-    "crypto":      ["bitcoin","ethereum","crypto","btc","eth","blockchain","defi","altcoin","token","sol","bnb"],
-    "geopolitics": ["election","war","ceasefire","nato","trade","fed","rate","recession","president","government","policy","sanctions","china","russia","ukraine","iran"],
-    "sports":      ["world cup","nba","nfl","champion","league","tournament","fifa","sport","soccer","basketball","football","tennis","golf","olympics"],
-    "other":       ["ai","artificial intelligence","robot","spacex","moon","inflation","ipo","social media","tech","elon","musk","climate","energy"]
+    "crypto":      ["bitcoin","ethereum","crypto","btc","eth","blockchain","defi","altcoin","token","sol","bnb","xrp"],
+    "geopolitics": ["election","war","ceasefire","nato","trade","fed","rate","recession","president","government","policy","sanctions","china","russia","ukraine","iran","trump","biden","congress"],
+    "sports":      ["world cup","nba","nfl","champion","league","tournament","fifa","sport","soccer","basketball","football","tennis","golf","olympics","win","match","game"],
+    "other":       ["ai","artificial","robot","spacex","moon","inflation","ipo","social media","tech","elon","climate","energy","apple","google","microsoft"]
 }
 
 async def fetch_polymarket_live() -> dict:
-    now = time.time()
-    if now-_poly_cache["ts"]<POLY_TTL and _poly_cache["data"]:
-        return _poly_cache["data"]
-
     categorised = {"crypto":[],"geopolitics":[],"sports":[],"other":[]}
 
     async with httpx.AsyncClient(headers=HEADERS) as client:
         try:
-            # Use Polymarket Gamma API — more reliable for active markets
+            # Try gamma API with active flag and high volume sort
             r = await client.get(
                 "https://gamma-api.polymarket.com/markets",
                 params={
                     "active":   "true",
                     "closed":   "false",
-                    "limit":    200,
+                    "limit":    300,
                     "order":    "volume24hr",
                     "ascending":"false"
                 },
                 timeout=20.0
             )
+            print(f"Polymarket status: {r.status_code}")
 
-            if r.status_code != 200:
-                raise Exception(f"Polymarket gamma API: {r.status_code}")
+            markets = []
+            if r.status_code == 200:
+                data = r.json()
+                markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
 
-            markets = r.json()
-            if isinstance(markets, dict):
-                markets = markets.get("data", []) or markets.get("markets", []) or []
+            print(f"Polymarket raw markets: {len(markets)}")
 
-            print(f"Polymarket markets fetched: {len(markets)}")
+            # Current year filter — skip anything clearly expired
+            current_year = 2026
+            skip_years   = ["2023","2024-01","2024-02","2024-03","2024-04","2024-05","2024-06"]
 
             for m in markets:
                 question = (m.get("question","") or m.get("title","") or "").strip()
-                if not question or len(question) < 10:
+                if not question or len(question) < 8:
                     continue
 
-                # Skip obviously old/resolved markets
-                end_date = m.get("endDate","") or m.get("end_date","") or ""
-                if end_date and "2023" in end_date:
-                    continue
-                if end_date and "2024" in end_date and "2024-01" in end_date:
+                # Skip old markets
+                end_date = str(m.get("endDate","") or m.get("end_date","") or "")
+                if any(y in end_date for y in skip_years):
                     continue
 
-                # Get YES price / odds
-                yes_price = 0.0
-                outcomes  = m.get("outcomes","")
-                if isinstance(outcomes, str):
-                    try: outcomes = json.loads(outcomes)
-                    except: outcomes = []
-                if isinstance(outcomes, list):
-                    for o in outcomes:
-                        if isinstance(o, str) and o.upper() == "YES":
-                            pass
-                        elif isinstance(o, dict) and str(o.get("name","")).upper() == "YES":
-                            yes_price = float(o.get("price",0) or 0)
-                            break
-
-                # Try outcomePrices field
-                if yes_price == 0:
-                    op = m.get("outcomePrices","")
-                    if isinstance(op, str):
-                        try: op = json.loads(op)
-                        except: op = []
-                    if isinstance(op, list) and len(op) > 0:
-                        try: yes_price = float(op[0])
-                        except: pass
-
-                # Try tokens
-                if yes_price == 0:
-                    for tk in (m.get("tokens",[]) or []):
-                        if isinstance(tk, dict) and str(tk.get("outcome","")).upper() == "YES":
-                            yes_price = float(tk.get("price",0) or 0)
-                            break
-
-                vol = float(
-                    m.get("volume24hr",0) or
-                    m.get("volume",0) or
-                    m.get("volumeNum",0) or 0
-                )
-
-                # Build display odds
-                if yes_price > 0:
-                    odds_str = f"{int(round(yes_price*100))}%"
-                else:
-                    odds_str = "N/A"
-
-                vol_str = f"${vol/1_000_000:.1f}M" if vol>=1_000_000 else f"${vol:,.0f}"
-
-                market_obj = {
-                    "title":  question,
-                    "odds":   odds_str,
-                    "volume": vol_str,
-                    "url":    f"https://polymarket.com/event/{m.get('conditionId','')}"
-                }
-
-                q_lower = question.lower()
-                assigned = False
-                for cat, keywords in POLY_CATEGORIES.items():
-                    if any(kw in q_lower for kw in keywords):
-                        if len(categorised[cat]) < 5:
-                            categorised[cat].append(market_obj)
-                            assigned = True
-                            break
-                if not assigned and len(categorised["other"]) < 5:
-                    categorised["other"].append(market_obj)
-
-                # Stop if all categories full
-                if all(len(v)>=5 for v in categorised.values()):
-                    break
-
-        except Exception as e:
-            print(f"Polymarket fetch error: {e}")
-
-    # Fallback data for any empty categories
-    fallback = {
-        "crypto": [
-            {"title":"Will Bitcoin exceed $120,000 before end of July 2026?","odds":"68%","volume":"$4.2M","url":"https://polymarket.com"},
-            {"title":"Will Ethereum surpass $4,000 this month?","odds":"54%","volume":"$2.1M","url":"https://polymarket.com"},
-            {"title":"Will total crypto market cap exceed $4T by August 2026?","odds":"61%","volume":"$3.8M","url":"https://polymarket.com"},
-            {"title":"Will a new altcoin enter top 10 by market cap in Q3 2026?","odds":"72%","volume":"$1.9M","url":"https://polymarket.com"},
-            {"title":"Will BTC dominance fall below 50% before September 2026?","odds":"44%","volume":"$2.7M","url":"https://polymarket.com"},
-        ],
-        "geopolitics": [
-            {"title":"Will US-China trade deal be reached by Q3 2026?","odds":"38%","volume":"$5.1M","url":"https://polymarket.com"},
-            {"title":"Will NATO expand membership before end of 2026?","odds":"29%","volume":"$1.4M","url":"https://polymarket.com"},
-            {"title":"Will there be a ceasefire in Ukraine by August 2026?","odds":"45%","volume":"$6.3M","url":"https://polymarket.com"},
-            {"title":"Will the US Federal Reserve cut rates in July 2026?","odds":"71%","volume":"$8.9M","url":"https://polymarket.com"},
-            {"title":"Will a G7 nation enter recession by end of 2026?","odds":"52%","volume":"$3.2M","url":"https://polymarket.com"},
-        ],
-        "sports": [
-            {"title":"Will the 2026 FIFA World Cup final feature a European team?","odds":"58%","volume":"$7.4M","url":"https://polymarket.com"},
-            {"title":"Will an African team reach the 2026 World Cup semifinals?","odds":"34%","volume":"$2.8M","url":"https://polymarket.com"},
-            {"title":"Will LeBron James win another NBA championship?","odds":"22%","volume":"$1.6M","url":"https://polymarket.com"},
-            {"title":"Will 2026 Tour de France be won by a non-European rider?","odds":"18%","volume":"$0.9M","url":"https://polymarket.com"},
-            {"title":"Will a world athletics record be broken at 2026 championships?","odds":"63%","volume":"$1.1M","url":"https://polymarket.com"},
-        ],
-        "other": [
-            {"title":"Will a major AI company IPO before end of 2026?","odds":"55%","volume":"$3.3M","url":"https://polymarket.com"},
-            {"title":"Will global inflation average below 3% in 2026?","odds":"47%","volume":"$2.6M","url":"https://polymarket.com"},
-            {"title":"Will a humanoid robot be commercially sold to consumers in 2026?","odds":"41%","volume":"$1.8M","url":"https://polymarket.com"},
-            {"title":"Will SpaceX land humans on the Moon in 2026?","odds":"31%","volume":"$4.1M","url":"https://polymarket.com"},
-            {"title":"Will a major social media platform lose 20% of users by Dec 2026?","odds":"36%","volume":"$1.2M","url":"https://polymarket.com"},
-        ]
-    }
-
-    for cat in categorised:
-        while len(categorised[cat]) < 5:
-            idx = len(categorised[cat])
-            if idx < len(fallback[cat]):
-                categorised[cat].append(fallback[cat][idx])
-            else:
-                break
-
-    return categorised
-
-async def analyse_poly_category(category: str, markets: list) -> dict:
-    if not groq_client or not markets:
-        m = markets or []
-        return {
-            "pick1":  {"title":m[0]["title"] if m else "—","odds":m[0]["odds"] if m else "—","reason":"Highest volume signals smart money conviction.","edge":"YES","confidence":"72%"},
-            "pick2":  {"title":m[1]["title"] if len(m)>1 else "—","odds":m[1]["odds"] if len(m)>1 else "—","reason":"Strong probability with positive expected value.","edge":"YES","confidence":"65%"},
-            "signal": {"direction":"BUY","thesis":"Market consensus favours positive outcome.","risk":"MED"}
-        }
-
-    markets_text = "\n".join([f"{i+1}. {m['title']} — Odds: {m['odds']} — Vol: {m['volume']}" for i,m in enumerate(markets)])
-
-    try:
-        res  = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role":"system","content":(
-                    "You are Phoenix Prediction Engine. Analyse prediction markets and pick 2 most profitable. "
-                    "Consider probability vs implied odds, volume as smart money signal, and current events. "
-                    "Respond ONLY in this exact JSON, no markdown:\n"
-                    '{"pick1":{"title":"...","odds":"...","reason":"...","edge":"YES or NO","confidence":"XX%"},'
-                    '"pick2":{"title":"...","odds":"...","reason":"...","edge":"YES or NO","confidence":"XX%"},'
-                    '"signal":{"direction":"BUY or SELL","thesis":"...","risk":"LOW or MED or HIGH"}}'
-                )},
-                {"role":"user","content":f"Category: {category.upper()}\n\n{markets_text}\n\nPick the 2 most profitable and generate a signal."}
-            ],
-            max_tokens=400,temperature=0.2,timeout=20
-        )
-        text = res.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
-        return json.loads(text)
-    except Exception as e:
-        print(f"Poly AI error [{category}]: {e}")
-        return {
-            "pick1":  {"title":markets[0]["title"],"odds":markets[0]["odds"],"reason":"Highest volume — smart money signal.","edge":"YES","confidence":"70%"},
-            "pick2":  {"title":markets[1]["title"] if len(markets)>1 else "—","odds":markets[1]["odds"] if len(markets)>1 else "—","reason":"Positive expected value.","edge":"YES","confidence":"64%"},
-            "signal": {"direction":"BUY","thesis":"Consensus points to positive outcome.","risk":"MED"}
-        }
-
-# ─── SELF PING ────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(self_ping_loop())
-
-async def self_ping_loop():
-    await asyncio.sleep(30)
-    url = os.getenv("RENDER_EXTERNAL_URL","https://phoenix-signal-backend.onrender.com")
-    while True:
-        try:
-            async with httpx.AsyncClient() as c:
-                await c.get(f"{url}/ping",timeout=10)
-                print("🔁 Self-ping OK")
-        except Exception as e:
-            print(f"Self-ping failed: {e}")
-        await asyncio.sleep(240)
-
-# ─── ROUTES ───────────────────────────────────────────────
-
-@app.get("/ping")
-async def ping(): return {"status":"alive"}
-
-@app.get("/")
-async def root(): return {"status":"online","engine":"Phoenix v5","data":"Binance+Bybit+Polymarket"}
-
-@app.get("/api/v2/history")
-async def get_signals(): return {"signals": await generate_signals()}
-
-@app.get("/api/v2/pairs")
-async def get_pairs(search: str = Query(default="")):
-    return await fetch_live_pairs(search.strip())
-
-@app.get("/api/v2/trending")
-async def get_trending():
-    async with httpx.AsyncClient(headers=HEADERS) as client:
-        try:
-            r = await client.get(f"{BINANCE}/ticker/24hr",timeout=12.0)
-            tickers = r.json() if r.status_code==200 else []
-            gainers = []
-            for t in tickers:
-                sym = t.get("symbol","")
-                if not sym.endswith("USDT"): continue
-                base = sym[:-4]
-                if base in EXCLUDED_BASE: continue
-                if any(f in base for f in FIAT_STRINGS): continue
-                vol    = float(t.get("quoteVolume",0) or 0)
-                change = float(t.get("priceChangePercent",0) or 0)
-                price  = float(t.get("lastPrice",0) or 0)
-                if vol<1_000_000 or price<=0: continue
-                gainers.append({
-                    "name":base,"symbol":base,
-                    "change":f"{change:+.2f}%",
-                    "volume":f"${vol/1_000_000:.1f}M",
-                    "price":f"{price:,.4f}" if price<1 else f"{price:,.2f}",
-                    "rank":"—","thumb":""
-                })
-            gainers.sort(key=lambda x:float(x["change"].replace("%","").replace("+","")),reverse=True)
-            return {"trending":gainers[:10]}
-        except Exception as e:
-            print(f"Trending error: {e}")
-    return {"trending":[]}
-
-@app.get("/api/v2/polymarket")
-async def get_polymarket():
-    now = time.time()
-    if now-_poly_cache["ts"]<POLY_TTL and _poly_cache["data"]:
-        return _poly_cache["data"]
-
-    markets = await fetch_polymarket_live()
-
-    results = await asyncio.gather(
-        analyse_poly_category("crypto",      markets.get("crypto",[])),
-        analyse_poly_category("geopolitics", markets.get("geopolitics",[])),
-        analyse_poly_category("sports",      markets.get("sports",[])),
-        analyse_poly_category("other",       markets.get("other",[])),
-        return_exceptions=True
-    )
-
-    def safe(r, cat):
-        if isinstance(r, dict): return r
-        m = markets.get(cat,[])
-        return {
-            "pick1":  {"title":m[0]["title"] if m else "—","odds":m[0]["odds"] if m else "—","reason":"High volume.","edge":"YES","confidence":"70%"},
-            "pick2":  {"title":m[1]["title"] if len(m)>1 else "—","odds":m[1]["odds"] if len(m)>1 else "—","reason":"Good EV.","edge":"YES","confidence":"63%"},
-            "signal": {"direction":"BUY","thesis":"Positive consensus.","risk":"MED"}
-        }
-
-    data = {
-        "crypto":      {"markets":markets.get("crypto",[]),      "analysis":safe(results[0],"crypto")},
-        "geopolitics": {"markets":markets.get("geopolitics",[]), "analysis":safe(results[1],"geopolitics")},
-        "sports":      {"markets":markets.get("sports",[]),      "analysis":safe(results[2],"sports")},
-        "other":       {"markets":markets.get("other",[]),       "analysis":safe(results[3],"other")},
-    }
-
-    _poly_cache["data"] = data
-    _poly_cache["ts"]   = time.time()
-    return data
-
-@app.get("/api/v2/news")
-async def news():
-    return {"news":[
-        {"title":"Altcoin season indicators flash green as BTC dominance dips below 54%.","source":"Phoenix Data Wire"},
-        {"title":"High volume breakouts detected across mid-cap DeFi tokens.","source":"Phoenix Data Wire"},
-        {"title":"Open interest on perpetuals surges across top altcoin pairs.","source":"Bybit Feed Node"},
-        {"title":"On-chain data shows accumulation patterns in Layer-2 tokens.","source":"Phoenix Data Wire"},
-        {"title":"Whale wallets accumulate BNB and AVAX in silent weekend session.","source":"Phoenix Data Wire"},
-        {"title":"Funding rates on perpetuals turn positive — bulls in control.","source":"Bybit Feed Node"},
-        {"title":"Liquidity pool depth expands as institutional volume rotates into alts.","source":"Bybit Feed Node"},
-    ]}
-
-@app.get("/api/v2/performance")
-async def performance():
-    return {"pnl":"+4.12%"}
-
-@app.post("/api/v2/chat")
-async def chat(request: ChatRequest):
-    if not groq_client:
-        return {"reply":"⚠️ AI Engine offline. GROQ_API_KEY not configured."}
-    try:
-        messages = [{"role":"system","content":(
-            "You are Phoenix Oracle, an elite crypto and financial markets intelligence engine. "
-            "Deep expertise in technical analysis, on-chain data, DeFi, tokenomics, derivatives, "
-            "market microstructure, risk management, and trading psychology. "
-            "When asked about any token — even obscure or newly listed — give analysis based on "
-            "its ticker, name, sector, and any available context. Never say a token doesn't exist. "
-            "When asked about trade setups give: entry logic, invalidation level, and targets. "
-            "Professional analysis, not financial advice. Sharp, direct, expert-level. Under 200 words."
-        )}]
-        for msg in request.history[-8:]:
-            if isinstance(msg,dict) and "role" in msg and "content" in msg:
-                messages.append({"role":msg["role"],"content":msg["content"]})
-        messages.append({"role":"user","content":request.prompt})
-        res = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",messages=messages,
-            max_tokens=280,temperature=0.3,timeout=20
-        )
-        return {"reply":res.choices[0].message.content.strip()}
-    except Exception as e:
-        print(f"Groq error: {e}")
-        return {"reply":"⚠️ AI Engine temporarily unavailable. Please retry."}
+                # Skip zero volume old markets
+                vol = safe_float(m.get("volume24hr") or m.get("volume") or m.get("volumeNum"))
+                if vol == 0:
+    
