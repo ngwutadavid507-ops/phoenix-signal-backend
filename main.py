@@ -463,4 +463,209 @@ async def fetch_polymarket_live() -> dict:
             {"title":"Will NATO expand membership before end of 2026?","odds":"29%","volume":"$1.4M","url":"https://polymarket.com"},
             {"title":"Will there be a ceasefire in Ukraine by August 2026?","odds":"45%","volume":"$6.3M","url":"https://polymarket.com"},
             {"title":"Will the US Federal Reserve cut rates in July 2026?","odds":"71%","volume":"$8.9M","url":"https://polymarket.com"},
-            {"title":"Will a G7 nation enter recession by end of 20
+            {"title":"Will a G7 nation enter recession by end of 2026?","odds":"52%","volume":"$3.2M","url":"https://polymarket.com"},
+        ],
+        "sports": [
+            {"title":"Will the 2026 FIFA World Cup final feature a European team?","odds":"58%","volume":"$7.4M","url":"https://polymarket.com"},
+            {"title":"Will an African team reach the 2026 World Cup semifinals?","odds":"34%","volume":"$2.8M","url":"https://polymarket.com"},
+            {"title":"Will LeBron James win another NBA championship?","odds":"22%","volume":"$1.6M","url":"https://polymarket.com"},
+            {"title":"Will 2026 Tour de France be won by a non-European rider?","odds":"18%","volume":"$0.9M","url":"https://polymarket.com"},
+            {"title":"Will a world athletics record be broken at 2026 championships?","odds":"63%","volume":"$1.1M","url":"https://polymarket.com"},
+        ],
+        "other": [
+            {"title":"Will a major AI company IPO before end of 2026?","odds":"55%","volume":"$3.3M","url":"https://polymarket.com"},
+            {"title":"Will global inflation average below 3% in 2026?","odds":"47%","volume":"$2.6M","url":"https://polymarket.com"},
+            {"title":"Will a humanoid robot be commercially sold to consumers in 2026?","odds":"41%","volume":"$1.8M","url":"https://polymarket.com"},
+            {"title":"Will SpaceX land humans on the Moon in 2026?","odds":"31%","volume":"$4.1M","url":"https://polymarket.com"},
+            {"title":"Will a major social media platform lose 20% of users by Dec 2026?","odds":"36%","volume":"$1.2M","url":"https://polymarket.com"},
+        ]
+    }
+
+    for cat in categorised:
+        while len(categorised[cat]) < 5:
+            idx = len(categorised[cat])
+            if idx < len(fallback[cat]):
+                categorised[cat].append(fallback[cat][idx])
+            else:
+                break
+
+    return categorised
+
+async def analyse_poly_category(category: str, markets: list) -> dict:
+    if not groq_client or not markets:
+        m = markets or []
+        return {
+            "pick1":  {"title":m[0]["title"] if m else "—","odds":m[0]["odds"] if m else "—","reason":"Highest volume signals smart money conviction.","edge":"YES","confidence":"72%"},
+            "pick2":  {"title":m[1]["title"] if len(m)>1 else "—","odds":m[1]["odds"] if len(m)>1 else "—","reason":"Strong probability with positive expected value.","edge":"YES","confidence":"65%"},
+            "signal": {"direction":"BUY","thesis":"Market consensus favours positive outcome.","risk":"MED"}
+        }
+
+    markets_text = "\n".join([f"{i+1}. {m['title']} — Odds: {m['odds']} — Vol: {m['volume']}" for i,m in enumerate(markets)])
+
+    try:
+        res  = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role":"system","content":(
+                    "You are Phoenix Prediction Engine. Analyse prediction markets and pick 2 most profitable. "
+                    "Consider probability vs implied odds, volume as smart money signal, and current events. "
+                    "Respond ONLY in this exact JSON, no markdown:\n"
+                    '{"pick1":{"title":"...","odds":"...","reason":"...","edge":"YES or NO","confidence":"XX%"},'
+                    '"pick2":{"title":"...","odds":"...","reason":"...","edge":"YES or NO","confidence":"XX%"},'
+                    '"signal":{"direction":"BUY or SELL","thesis":"...","risk":"LOW or MED or HIGH"}}'
+                )},
+                {"role":"user","content":f"Category: {category.upper()}\n\n{markets_text}\n\nPick the 2 most profitable and generate a signal."}
+            ],
+            max_tokens=400,temperature=0.2,timeout=20
+        )
+        text = res.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"Poly AI error [{category}]: {e}")
+        return {
+            "pick1":  {"title":markets[0]["title"],"odds":markets[0]["odds"],"reason":"Highest volume — smart money signal.","edge":"YES","confidence":"70%"},
+            "pick2":  {"title":markets[1]["title"] if len(markets)>1 else "—","odds":markets[1]["odds"] if len(markets)>1 else "—","reason":"Positive expected value.","edge":"YES","confidence":"64%"},
+            "signal": {"direction":"BUY","thesis":"Consensus points to positive outcome.","risk":"MED"}
+        }
+
+# ─── SELF PING ────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(self_ping_loop())
+
+async def self_ping_loop():
+    await asyncio.sleep(30)
+    url = os.getenv("RENDER_EXTERNAL_URL","https://phoenix-signal-backend.onrender.com")
+    while True:
+        try:
+            async with httpx.AsyncClient() as c:
+                await c.get(f"{url}/ping",timeout=10)
+                print("🔁 Self-ping OK")
+        except Exception as e:
+            print(f"Self-ping failed: {e}")
+        await asyncio.sleep(240)
+
+# ─── ROUTES ───────────────────────────────────────────────
+
+@app.get("/ping")
+async def ping(): return {"status":"alive"}
+
+@app.get("/")
+async def root(): return {"status":"online","engine":"Phoenix v5","data":"Binance+Bybit+Polymarket"}
+
+@app.get("/api/v2/history")
+async def get_signals(): return {"signals": await generate_signals()}
+
+@app.get("/api/v2/pairs")
+async def get_pairs(search: str = Query(default="")):
+    return await fetch_live_pairs(search.strip())
+
+@app.get("/api/v2/trending")
+async def get_trending():
+    async with httpx.AsyncClient(headers=HEADERS) as client:
+        try:
+            r = await client.get(f"{BINANCE}/ticker/24hr",timeout=12.0)
+            tickers = r.json() if r.status_code==200 else []
+            gainers = []
+            for t in tickers:
+                sym = t.get("symbol","")
+                if not sym.endswith("USDT"): continue
+                base = sym[:-4]
+                if base in EXCLUDED_BASE: continue
+                if any(f in base for f in FIAT_STRINGS): continue
+                vol    = float(t.get("quoteVolume",0) or 0)
+                change = float(t.get("priceChangePercent",0) or 0)
+                price  = float(t.get("lastPrice",0) or 0)
+                if vol<1_000_000 or price<=0: continue
+                gainers.append({
+                    "name":base,"symbol":base,
+                    "change":f"{change:+.2f}%",
+                    "volume":f"${vol/1_000_000:.1f}M",
+                    "price":f"{price:,.4f}" if price<1 else f"{price:,.2f}",
+                    "rank":"—","thumb":""
+                })
+            gainers.sort(key=lambda x:float(x["change"].replace("%","").replace("+","")),reverse=True)
+            return {"trending":gainers[:10]}
+        except Exception as e:
+            print(f"Trending error: {e}")
+    return {"trending":[]}
+
+@app.get("/api/v2/polymarket")
+async def get_polymarket():
+    now = time.time()
+    if now-_poly_cache["ts"]<POLY_TTL and _poly_cache["data"]:
+        return _poly_cache["data"]
+
+    markets = await fetch_polymarket_live()
+
+    results = await asyncio.gather(
+        analyse_poly_category("crypto",      markets.get("crypto",[])),
+        analyse_poly_category("geopolitics", markets.get("geopolitics",[])),
+        analyse_poly_category("sports",      markets.get("sports",[])),
+        analyse_poly_category("other",       markets.get("other",[])),
+        return_exceptions=True
+    )
+
+    def safe(r, cat):
+        if isinstance(r, dict): return r
+        m = markets.get(cat,[])
+        return {
+            "pick1":  {"title":m[0]["title"] if m else "—","odds":m[0]["odds"] if m else "—","reason":"High volume.","edge":"YES","confidence":"70%"},
+            "pick2":  {"title":m[1]["title"] if len(m)>1 else "—","odds":m[1]["odds"] if len(m)>1 else "—","reason":"Good EV.","edge":"YES","confidence":"63%"},
+            "signal": {"direction":"BUY","thesis":"Positive consensus.","risk":"MED"}
+        }
+
+    data = {
+        "crypto":      {"markets":markets.get("crypto",[]),      "analysis":safe(results[0],"crypto")},
+        "geopolitics": {"markets":markets.get("geopolitics",[]), "analysis":safe(results[1],"geopolitics")},
+        "sports":      {"markets":markets.get("sports",[]),      "analysis":safe(results[2],"sports")},
+        "other":       {"markets":markets.get("other",[]),       "analysis":safe(results[3],"other")},
+    }
+
+    _poly_cache["data"] = data
+    _poly_cache["ts"]   = time.time()
+    return data
+
+@app.get("/api/v2/news")
+async def news():
+    return {"news":[
+        {"title":"Altcoin season indicators flash green as BTC dominance dips below 54%.","source":"Phoenix Data Wire"},
+        {"title":"High volume breakouts detected across mid-cap DeFi tokens.","source":"Phoenix Data Wire"},
+        {"title":"Open interest on perpetuals surges across top altcoin pairs.","source":"Bybit Feed Node"},
+        {"title":"On-chain data shows accumulation patterns in Layer-2 tokens.","source":"Phoenix Data Wire"},
+        {"title":"Whale wallets accumulate BNB and AVAX in silent weekend session.","source":"Phoenix Data Wire"},
+        {"title":"Funding rates on perpetuals turn positive — bulls in control.","source":"Bybit Feed Node"},
+        {"title":"Liquidity pool depth expands as institutional volume rotates into alts.","source":"Bybit Feed Node"},
+    ]}
+
+@app.get("/api/v2/performance")
+async def performance():
+    return {"pnl":"+4.12%"}
+
+@app.post("/api/v2/chat")
+async def chat(request: ChatRequest):
+    if not groq_client:
+        return {"reply":"⚠️ AI Engine offline. GROQ_API_KEY not configured."}
+    try:
+        messages = [{"role":"system","content":(
+            "You are Phoenix Oracle, an elite crypto and financial markets intelligence engine. "
+            "Deep expertise in technical analysis, on-chain data, DeFi, tokenomics, derivatives, "
+            "market microstructure, risk management, and trading psychology. "
+            "When asked about any token — even obscure or newly listed — give analysis based on "
+            "its ticker, name, sector, and any available context. Never say a token doesn't exist. "
+            "When asked about trade setups give: entry logic, invalidation level, and targets. "
+            "Professional analysis, not financial advice. Sharp, direct, expert-level. Under 200 words."
+        )}]
+        for msg in request.history[-8:]:
+            if isinstance(msg,dict) and "role" in msg and "content" in msg:
+                messages.append({"role":msg["role"],"content":msg["content"]})
+        messages.append({"role":"user","content":request.prompt})
+        res = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",messages=messages,
+            max_tokens=280,temperature=0.3,timeout=20
+        )
+        return {"reply":res.choices[0].message.content.strip()}
+    except Exception as e:
+        print(f"Groq error: {e}")
+        return {"reply":"⚠️ AI Engine temporarily unavailable. Please retry."}
